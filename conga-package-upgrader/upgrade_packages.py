@@ -331,7 +331,7 @@ def cmd_find_revenue_version(args):
     # --nuget-versions-file avoids PowerShell quoting issues with JSON strings
     nuget_map: dict[str, str] = {}
     if args.nuget_versions_file:
-        nuget_map = json.loads(Path(args.nuget_versions_file).read_text(encoding="utf-8"))
+        nuget_map = json.loads(Path(args.nuget_versions_file).read_text(encoding="utf-8-sig"))
     elif args.nuget_versions:
         nuget_map = json.loads(args.nuget_versions)
 
