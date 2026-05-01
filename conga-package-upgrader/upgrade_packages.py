@@ -109,7 +109,11 @@ def cmd_patch(args):
     """Apply version updates to all matching .csproj files."""
     root        = Path(args.solution_path).resolve()
     prefix      = args.prefix
-    version_map = json.loads(args.versions)
+    # Load version_map from file (shell-safe) or inline JSON
+    if getattr(args, "versions_file", None):
+        version_map = json.loads(Path(args.versions_file).read_text(encoding="utf-8-sig"))
+    else:
+        version_map = json.loads(args.versions)
 
     # Validate all target versions before patching
     invalid = {pkg: ver for pkg, ver in version_map.items() 
@@ -507,7 +511,8 @@ _COMMANDS = [
     ("scan", cmd_scan, _SHARED_SOLUTION_ARGS),
 
     ("patch", cmd_patch, _SHARED_SOLUTION_ARGS + [
-        ("--versions", {"required": True, "help": 'JSON map {"Package":"version",...}'}),
+        ("--versions",      {"required": False, "default": None, "help": 'Inline JSON map {"Package":"version",...} — avoid in PowerShell; prefer --versions-file'}),
+        ("--versions-file", {"default": None, "help": "Path to JSON file {\"Package\":\"version\",...} — shell-safe alternative to --versions"}),
         ("--target-sprint", {"default": "unknown"}),
     ]),
 
