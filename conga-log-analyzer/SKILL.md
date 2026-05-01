@@ -1,4 +1,4 @@
-# Conga Log Analyzer Skill
+﻿# Conga Log Analyzer Skill
 
 ## Purpose
 Download Grafana Loki logs by TraceId, analyze errors/exceptions, and identify root cause.
@@ -7,7 +7,7 @@ Uses Python (stdlib only, zero dependencies).
 ## Usage
 
 ```bash
-cd "C:\Users\nsakthivel\SourceCode\.github\copilot\skills\conga-log-analyzer"
+cd "..\copilot-skills\conga-log-analyzer"
 
 # By TraceId (dev/qa default to deployment_environment=rls04)
 python log_downloader.py --trace-id "abc123" --environment dev
