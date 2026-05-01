@@ -1,0 +1,22 @@
+{
+  "nuget": {
+    "source_name": "Conga Platform",
+    "package_prefix": "Conga.Platform.",
+    "mcp_tool_get_version": "get_latest_package_version",
+    "mcp_tool_apply": "update_package_version",
+    "cli_discovery_note": "dotnet package search is used to find the latest minor at the target sprint — NuGet MCP get_latest_package_version returns the absolute latest, not a sprint-prefixed version."
+  },
+  "sprint": {
+    "format": "YYYYMM.sprint.minor — e.g. 202604.2.3 = April 2026 sprint 2 minor 3",
+    "releases_per_month": 2,
+    "target_rule": "previous_month_sprint_1",
+    "example": "202604.2 -> 202603.1"
+  },
+  "pr": {
+    "base_branch": "master",
+    "branch_prefix": "platform-upgrade/",
+    "org": "congaengr",
+    "draft": true
+  }
+}
+  

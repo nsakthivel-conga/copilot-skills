@@ -1,0 +1,17 @@
+# Runtime output — generated during skill execution, never commit
+**/upgrades/
+**/downloads/
+**/pr-body.md
+**/changes.json
+**/plan.json
+**/raw-logs.json
+**/summary.json
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# VS artifacts
+**/.vs/
+**/*.zip

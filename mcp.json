@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "Atlassian-Rovo-MCP": {
+      "args": [ "-y", "mcp-remote@latest", "https://mcp.atlassian.com/v1/mcp" ],
+      "command": "C:\\Program Files\\nodejs\\npx.cmd"
+    },
+    "NuGet-MCP": {
+      "type": "stdio",
+      "command": "dnx",
+      "args": [ "NuGet.Mcp.Server", "--yes" ],
+      "comment": "Official NuGet MCP Server — auto-discovers all machine-configured NuGet sources (including Conga Platform Artifactory). VS 2026: also available in-box via Copilot chat Tools menu. Requires .NET 10 SDK for dnx."
+    }
+  }
+}
