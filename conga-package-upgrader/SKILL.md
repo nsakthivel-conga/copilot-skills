@@ -159,12 +159,45 @@ Artifactory AQL — empty results (NuGet packages not stored as Maven artifacts)
 
 ---
 
-### Step 4 — Confirm with user
-Show combined upgrade plan (all versions from Steps 2–3):
-- **Platform** packages: current → resolved version from Step 3
-- **Revenue** packages: current → absolute latest from Step 2
+### Step 4 — Compare versions and confirm with user
+
+**Before showing the plan, compare resolved target versions (Steps 2–3) against current installed versions (Step 1 scan).**
+
+For each package:
+- If `resolved version == current version` → mark as **✅ Already at latest** — skip it
+- If `resolved version != current version` → mark as **📦 Will upgrade**
+
+**Show the combined status table:**
+
+```
+Package Upgrade Plan — Conga.Revenue.Asset.API
+
+Platform (target sprint: 202604.2)
+  📦 Authorization.Middleware   202602.1.8  →  202604.2.11
+  ✅ ClientSDK                  202604.2.11     already at target
+
+Revenue (absolute latest)
+  📦 Controllers               202604.1.10 →  202605.1.10
+  ✅ Common.Services            202605.1.10     already at latest
+  📦 Runtime.DataProvider      202604.1.4  →  202605.1.12
+```
+
+**If ALL packages are already at latest → stop immediately:**
+```
+✅ All packages are already at the latest versions. No upgrade needed.
+   Platform: all at 202604.2.*
+   Revenue:  all at 202605.1.*
+Skipping Steps 5–11 (no changes to apply, build, or PR).
+```
+
+**If some packages need upgrading** — show only the packages that will change and wait for approval:
+```
+3 package(s) will be upgraded, 2 already at latest — proceed? (yes/no)
+```
 
 **Gate:** Wait for explicit approval before modifying any files.
+
+> Only packages marked 📦 are passed to Step 5. Packages marked ✅ are not touched.
 
 ---
 
@@ -217,6 +250,13 @@ Run once per namespace. Writes `upgrades/changes.json` used by `generate-pr-body
 ---
 
 ### Step 7 — Build
+
+> **Pre-check:** If Step 5 applied **zero changes** (all packages were already at target versions
+> and confirmed at Step 4), skip Steps 7–11 entirely and report:
+> ```
+> ✅ No package versions were changed — build and PR skipped.
+> ```
+
 ```powershell
 cd "<solution-root>" ; dotnet build
 ```
