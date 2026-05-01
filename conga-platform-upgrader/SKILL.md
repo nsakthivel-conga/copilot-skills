@@ -92,7 +92,7 @@ Target: **absolute latest** — use `NuGet_MCP_update_package_version` directly 
 > `⏳ [Project 1/2: Conga.Revenue.Asset.API] [Step 1/11] Scanning...`
 
 ```powershell
-cd ".github\copilot\skills\conga-platform-upgrader"
+cd "..\copilot-skills\conga-platform-upgrader"
 
 # Platform packages
 python upgrade_packages.py scan --solution-path "<root>"
@@ -227,7 +227,7 @@ Locate `.trx` file for PR body.
 
 ### Step 9 — Generate PR body
 ```powershell
-cd ".github\copilot\skills\conga-platform-upgrader"
+cd "..\copilot-skills\conga-platform-upgrader"
 python upgrade_packages.py generate-pr-body `
   --changes-json "<root>\upgrades\changes.json" `
   --trx-path "<path-to-trx>"
@@ -252,7 +252,7 @@ git push origin HEAD
 gh pr create --draft --base master `
   --head <user>:package-upgrade-<timestamp> `
   --title "Upgrade Conga packages: Platform <sprint> + Revenue latest" `
-  --body-file ".github\copilot\skills\conga-platform-upgrader\upgrades\pr-body.md"
+  --body-file "..\copilot-skills\conga-platform-upgrader\upgrades\pr-body.md"
 ```
 
 
