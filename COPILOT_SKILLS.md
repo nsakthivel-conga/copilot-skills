@@ -1,46 +1,7 @@
 ﻿# Copilot Skills
 
-> Team-defined AI workflows for Visual Studio 2022 (`View > GitHub Copilot Chat`).
-> **Skills source:** `congaengr/copilot-skills` — clone once, shared across all Conga repos on this machine.
-
-## One-Time Tool Setup
-
-| Tool | Purpose | Install |
-|------|---------|---------|
-| **GitHub CLI** | PR Porter — read/create PRs | `winget install GitHub.cli` then `gh auth login` |
-| **Python 3.10+** | Log Analyzer + PR Porter | verify: `python --version` |
-| **Node.js** | Atlassian MCP auth (`npx`) | https://nodejs.org |
-| **.NET 10 SDK** | NuGet MCP Server (`dnx`) | ships with VS 2026; verify: `dotnet --list-sdks` |
-
-**GitHub CLI — First-Time Auth**
-
-```
-winget install GitHub.cli   # ⏱ 1–3 min; restart terminal after
-gh auth login               # choose: GitHub.com → HTTPS → Login with a web browser
-gh auth status              # verify: "Logged in to github.com as <your-username>"
-```
-> ⚠️ First `gh` call after login is slow (2–5 s) — cold token read + HTTPS round-trip. Normal, do not retry.
-
----
-
-**Authenticate Atlassian MCP** (once per machine) — run in the Visual Studio terminal:
-```
-npx -y mcp-remote@latest https://mcp.atlassian.com/v1/mcp
-```
-A browser window opens → sign in with your Atlassian account → token is cached automatically.
-
----
-
-## Per-Project Setup (do once per repo)
-
-| Step | Action |
-|------|--------|
-| 1 | **Copy this file** (`COPILOT_SKILLS.md`) into the project repo root so Copilot can read it in that workspace |
-| 2 | **Copy `mcp.json`** from `copilot-skills/` into the project `.vscode/` folder to load the Atlassian + NuGet MCP servers |
-| 3 | **Verify Atlassian MCP auth** — if not yet authenticated on this machine, run: `npx -y mcp-remote@latest https://mcp.atlassian.com/v1/mcp` in the VS terminal and sign in via browser |
-| 4 | **Enable NuGet MCP** (VS 2026 in-box) — Copilot Chat → `⚙ Tools` menu → tick **NuGet** |
-
----
+> Team-defined AI workflows for Visual Studio 2022/2026 (`View > GitHub Copilot Chat`).
+> **Setup and installation:** see `README.md` in [`congaengr/copilot-skills`](https://github.com/congaengr/copilot-skills).
 
 ## Available Skills
 
