@@ -86,6 +86,31 @@ Target: **absolute latest** — use `NuGet_MCP_update_package_version` directly 
 
 ---
 
+### Step 0.5 — Sync project to latest upstream master
+
+> **Run once per project before scanning. Uses plain `git` CLI — no extra tools needed.**
+> Skip this step only if the user explicitly says they are already on a clean, up-to-date master.
+
+```powershell
+cd "<project-root>"
+git checkout master
+git fetch upstream --quiet
+git merge upstream/master --ff-only --quiet
+git status --short   # must be empty — no uncommitted changes before scan
+```
+
+| Check | Action if failed |
+|---|---|
+| Not on master | `git checkout master` first |
+| Local commits ahead | Stash or abort — do not upgrade on top of uncommitted work |
+| `--ff-only` fails (diverged) | Run `git merge upstream/master` manually, resolve, then continue |
+| `upstream` remote missing | `git remote add upstream https://github.com/congaengr/<Repo>` |
+
+> **Why this matters:** scanning on a stale or feature branch gives wrong "current version" baselines.
+> Step 4's "already at latest" check is only reliable when scanning from the true production state.
+
+---
+
 ### Step 1 — Scan solution
 
 > Repeat Steps 1–11 for **each project** in the resolved list (Step 0). Show progress banner with project name:
@@ -108,6 +133,10 @@ Parse JSON output: `prefix`, `current_sprint`, `packages` map.
 ---
 
 ### Step 2 — Discover versions for all packages
+
+> **Speed tip:** Call `NuGet_MCP_get_latest_package_version` for **all** packages at once in a single
+> message — Copilot issues them in parallel. Do NOT call them one by one in separate messages.
+
 Call `NuGet_MCP_get_latest_package_version` for **every** package found in Step 1.
 
 **Platform packages:**
@@ -233,19 +262,24 @@ NuGet_MCP_update_package_version(
 
 ---
 
-### Step 6 — Record changes for PR body
-Write `upgrades/changes.json` from the before (Step 1 scan) and after (Step 5 applied) version maps:
-```powershell
-# Save before-versions from Step 1 scan output
-# Save after-versions from Steps 2-3 resolved output
-python upgrade_packages.py record-changes `
-  --solution-path "<root>" `
-  --prefix "Conga.Platform." `
-  --before "<root>\upgrades\before_platform.json" `
-  --after  "<root>\upgrades\after_platform.json" `
-  --target-sprint "<sprint>"
+### Step 6 — Write plan.json for PR body
+
+After Step 5 applies changes, write `upgrades/plan.json` with the confirmed upgrade plan.
+Copilot writes this file directly (no script needed) — bypasses shell JSON-quoting entirely.
+
+```json
+{
+  "title": "Upgrade Conga packages: Platform 202604.2 + Revenue 202605.1",
+  "sprint": "202604.2",
+  "changes": [
+    {"project": "Asset.API",     "namespace": "Platform", "package": "Authorization.Middleware", "from": "202602.1.8",  "to": "202604.2.11"},
+    {"project": "Asset.Manager", "namespace": "Revenue",  "package": "Callbacks",               "from": "202603.2.2",  "to": "202604.2.2"}
+  ],
+  "skipped": []
+}
 ```
-Run once per namespace. Writes `upgrades/changes.json` used by `generate-pr-body`.
+
+Save to: `<copilot-skills-root>\conga-package-upgrader\upgrades\plan.json`
 
 ---
 
@@ -266,18 +300,18 @@ Errors are blocking. Warnings are acceptable.
 
 ### Step 8 — Test
 ```powershell
-dotnet test --logger "trx;LogFileName=TestResults.trx"
+cd "<solution-root>" ; dotnet test --no-build --logger "trx;LogFileName=TestResults.trx" --results-directory .\TestResults
 ```
-Locate `.trx` file for PR body.
+`--no-build` skips redundant rebuild — saves 1–2 min on large solutions. Locate `.trx` under `TestResults\`.
 
 ---
 
 ### Step 9 — Generate PR body
 ```powershell
-cd "..\copilot-skills\conga-platform-upgrader"
+cd "..\copilot-skills\conga-package-upgrader"
 python upgrade_packages.py generate-pr-body `
-  --changes-json "<root>\upgrades\changes.json" `
-  --trx-path "<path-to-trx>"
+  --plan "upgrades\plan.json" `
+  --trx-path "<root>\TestResults\TestResults.trx"
 ```
 Writes `upgrades/pr-body.md`.
 
@@ -289,8 +323,10 @@ cd "<solution-root>"
 git checkout -b package-upgrade-<timestamp>
 git add .
 git commit -m "Upgrade Conga packages: Platform <sprint> + Revenue latest"
-git push origin HEAD
+git -c http.sslVerify=false push origin HEAD
 ```
+
+> If push fails with SSL error: use `git -c http.sslVerify=false push origin HEAD` (corporate proxy cert).
 
 ---
 
@@ -299,7 +335,7 @@ git push origin HEAD
 gh pr create --draft --base master `
   --head <user>:package-upgrade-<timestamp> `
   --title "Upgrade Conga packages: Platform <sprint> + Revenue latest" `
-  --body-file "..\copilot-skills\conga-platform-upgrader\upgrades\pr-body.md"
+  --body-file "..\copilot-skills\conga-package-upgrader\upgrades\pr-body.md"
 ```
 
 
