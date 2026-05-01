@@ -326,7 +326,14 @@ def cmd_find_revenue_version(args):
     source       = args.source
     sol_path     = Path(args.solution_path).resolve() if args.solution_path else None
     creds        = (args.username, args.password) if args.username else _read_nuget_creds(source, sol_path)
-    nuget_map: dict[str, str] = json.loads(args.nuget_versions) if args.nuget_versions else {}
+
+    # Load nuget_map from file (shell-safe) or inline JSON
+    # --nuget-versions-file avoids PowerShell quoting issues with JSON strings
+    nuget_map: dict[str, str] = {}
+    if args.nuget_versions_file:
+        nuget_map = json.loads(Path(args.nuget_versions_file).read_text(encoding="utf-8"))
+    elif args.nuget_versions:
+        nuget_map = json.loads(args.nuget_versions)
 
     # Auto-discover packages from solution if no explicit nuget-versions provided
     if not nuget_map and args.solution_path:
@@ -519,12 +526,13 @@ _COMMANDS = [
     # (e.g. 2024011.* with 7-digit prefix) trigger OData $orderby=Published+desc fallback
     # to get the true latest by publish date - no year filter, works across year boundaries.
     ("find-revenue-version", cmd_find_revenue_version, [
-        ("--nuget-versions", {"default": None, "help": 'JSON map {"Package":"nuget-mcp-version",...} from NuGet MCP; conflicting versions trigger OData fallback'}),
-        ("--solution-path", {"default": None, "help": "Solution root; auto-discovers Conga.Revenue.* packages when --nuget-versions is omitted"}),
-        ("--prefix", {"default": "Conga.Revenue.", "help": "Package prefix for solution scan (default: Conga.Revenue.)"}),
-        ("--source", {"default": "https://art01.apttuscloud.io/artifactory/api/nuget/conga-platform-nuget", "help": "NuGet v2 feed URL"}),
-        ("--username", {"default": None, "help": "Feed username (optional; uses NuGet.Config if omitted)"}),
-        ("--password", {"default": None, "help": "Feed password / API key"}),
+        ("--nuget-versions",      {"default": None, "help": 'Inline JSON map {"Pkg":"ver",...} — avoid in PowerShell (quoting issues); prefer --nuget-versions-file'}),
+        ("--nuget-versions-file", {"default": None, "help": "Path to a JSON file {\"Pkg\":\"ver\",...} — shell-safe alternative to --nuget-versions"}),
+        ("--solution-path",       {"default": None, "help": "Solution root; auto-discovers Conga.Revenue.* packages when neither --nuget-versions nor --nuget-versions-file is supplied"}),
+        ("--prefix",              {"default": "Conga.Revenue.", "help": "Package prefix for solution scan (default: Conga.Revenue.)"}),
+        ("--source",              {"default": "https://art01.apttuscloud.io/artifactory/api/nuget/conga-platform-nuget", "help": "NuGet v2 feed URL"}),
+        ("--username",            {"default": None, "help": "Feed username (optional; uses NuGet.Config if omitted)"}),
+        ("--password",            {"default": None, "help": "Feed password / API key"}),
     ]),
 
     ("parse-trx", None, [
