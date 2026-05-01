@@ -36,6 +36,33 @@ name: conga-package-upgrader
 
 ---
 
+## Git Remote Layout
+
+> ⚠️ **Fork-only rule (enforced throughout this skill):**
+> All branch pushes and draft PRs **must** target your personal fork (`origin`).
+> **Never push directly to `upstream` or `congaengr`.**
+> Changes reach the original repo **only** via a reviewed and approved PR.
+
+| Remote | URL pattern | Purpose |
+|--------|-------------|---------|
+| `origin` | `https://github.com/<your-user>/<Repo>` | Your personal fork — push here |
+| `upstream` | `https://github.com/congaengr/<Repo>` | Original repo — read-only (fetch/merge only) |
+| `congaengr` | `https://github.com/congaengr/<Repo>` | Alias for upstream — treat as read-only |
+
+Verify before starting any project:
+```powershell
+git remote -v
+# origin   https://github.com/<your-user>/<Repo> (fetch)
+# origin   https://github.com/<your-user>/<Repo> (push)
+# upstream https://github.com/congaengr/<Repo>   (fetch)
+```
+If `origin` points to `congaengr`, **stop** — correct it before proceeding:
+```powershell
+git remote set-url origin https://github.com/<your-user>/<Repo>
+```
+
+---
+
 ## Version Schemes
 
 **Conga.Platform.*** — Sprint versioning
@@ -91,16 +118,30 @@ Target: **absolute latest** — use `NuGet_MCP_update_package_version` directly 
 > **Run once per project before scanning. Uses plain `git` CLI — no extra tools needed.**
 > Skip this step only if the user explicitly says they are already on a clean, up-to-date master.
 
+> ⚠️ **Fork-only reminder:** `origin` must be your personal fork. This step reads from `upstream` only.
+> All subsequent pushes (Step 10) and PRs (Step 11) target `origin` — **never `upstream` or `congaengr`**.
+
 ```powershell
 cd "<project-root>"
+git remote -v                               # verify: origin = your fork, upstream = congaengr
 git checkout master
-git fetch upstream --quiet
-git merge upstream/master --ff-only --quiet
+
+# Determine sync remote: prefer 'upstream', fall back to 'congaengr'
+$syncRemote = if (git remote | Select-String "^upstream$") { "upstream" } else { "congaengr" }
+
+# Skip fetch if already fetched within the last 60 seconds (multi-project speed)
+$fetchHead = Get-Item ".git\FETCH_HEAD" -ErrorAction SilentlyContinue
+if (!$fetchHead -or ((Get-Date) - $fetchHead.LastWriteTime).TotalSeconds -gt 60) {
+    git -c http.sslVerify=false fetch $syncRemote --quiet
+}
+
+git merge "$syncRemote/master" --ff-only --quiet
 git status --short   # must be empty — no uncommitted changes before scan
 ```
 
 | Check | Action if failed |
 |---|---|
+| `origin` points to `congaengr` | `git remote set-url origin https://github.com/<your-user>/<Repo>` |
 | Not on master | `git checkout master` first |
 | Local commits ahead | Stash or abort — do not upgrade on top of uncommitted work |
 | `--ff-only` fails (diverged) | Run `git merge upstream/master` manually, resolve, then continue |
@@ -117,16 +158,14 @@ git status --short   # must be empty — no uncommitted changes before scan
 > `⏳ [Project 1/2: Conga.Revenue.Asset.API] [Step 1/11] Scanning...`
 
 ```powershell
-cd "..\copilot-skills\conga-platform-upgrader"
-
-# Platform packages
-python upgrade_packages.py scan --solution-path "<root>"
-
-# Revenue packages
-python upgrade_packages.py scan --solution-path "<root>" --prefix "Conga.Revenue."
+# Both scans use the same script path — note: folder is conga-package-upgrader (not platform)
+python "..\copilot-skills\conga-package-upgrader\upgrade_packages.py" scan --solution-path "<root>"
+python "..\copilot-skills\conga-package-upgrader\upgrade_packages.py" scan --solution-path "<root>" --prefix "Conga.Revenue."
 ```
 Run both when `"Upgrade all Conga packages"` is requested.
 Parse JSON output: `prefix`, `current_sprint`, `packages` map.
+
+> **Note:** Both calls read the same `.csproj` files. A future `--all-prefixes` flag would merge them into one pass.
 
 > The script reports `"No packages found"` if `--prefix` does not match. Always pass `--prefix Conga.Revenue.` for Revenue.
 
@@ -230,56 +269,73 @@ Skipping Steps 5–11 (no changes to apply, build, or PR).
 
 ---
 
-### Step 5 — Apply all versions via NuGet MCP
-Use `NuGet_MCP_update_package_version` for **both** Platform and Revenue — exact versions are known, no wildcards needed.
+### Step 5 — Apply all versions via NuGet MCP or patch fallback
 
-**Platform** (versions from Step 3):
+**Primary:** Use a **single** `NuGet_MCP_update_package_version` call with all packages (Platform + Revenue combined):
 ```
 NuGet_MCP_update_package_version(
   solutionDirectory = "<root>",
-  projectPaths      = [<non-test .csproj paths from Step 1 Platform scan>],
-  packagesNames     = ["Conga.Platform.Authorization.Middleware", "Conga.Platform.ClientSDK", ...],
-  packagesVersions  = ["202604.1.8", "202604.1.9", ...]   <- exact versions from Step 3 OData
+  projectPaths      = [<all non-test .csproj paths from Step 1>],
+  packagesNames     = [<all Platform packages> + <all Revenue packages>],
+  packagesVersions  = [<Step 3 OData versions> + <Step 2 latest versions>]
 )
 ```
 
-**Revenue** (absolute latest from Step 2):
-```
-NuGet_MCP_update_package_version(
-  solutionDirectory = "<root>",
-  projectPaths      = [<non-test .csproj paths from Step 1 Revenue scan>],
-  packagesNames     = ["Conga.Revenue.Controllers", "Conga.Revenue.Common.Services", ...],
-  packagesVersions  = ["<latest>", "<latest>", ...]   <- from Step 2 NuGet MCP query
-)
+**Transitive downgrade decision rule:**
+If NuGet MCP proposes a transitive dependency change where `currentVersion > proposedVersion`:
+- If the downgrade is **caused by** the new `Conga.Platform.*` or `Conga.Revenue.*` package requiring it → **accept it** (the Conga package knows its dependencies)
+- If the downgrade is for an unrelated system package (e.g. `System.Security.Cryptography.ProtectedData` 6.0.0→4.5.0) not required by any Conga package → **reject it** and fall back to `patch`
+
+**Fallback:** If NuGet MCP proposes unacceptable transitive downgrades, use `patch` subcommand directly:
+```powershell
+python "..\copilot-skills\conga-package-upgrader\upgrade_packages.py" patch `
+  --solution-path "<root>" --versions-file "$env:TEMP\all_versions.json"
+python "..\copilot-skills\conga-package-upgrader\upgrade_packages.py" patch `
+  --solution-path "<root>" --prefix "Conga.Revenue." --versions-file "$env:TEMP\revenue_versions.json"
 ```
 
-> **Why NuGet MCP for Platform too?**  
-> Exact versions are known after Step 3. `NuGet_MCP_update_package_version` accepts exact versions  
-> and edits `.csproj` files directly — no PowerShell JSON-quoting issues, no Python script needed.
-
-> **`patch` subcommand** in `upgrade_packages.py` remains available as a manual fallback
-> if NuGet MCP is unavailable.
+> **Why one combined call?** NuGet MCP resolves dependencies holistically. Splitting into two calls
+> can cause the second call to conflict with packages applied by the first.
 
 ---
 
-### Step 6 — Write plan.json for PR body
+### Step 6 — Write PR body directly
 
-After Step 5 applies changes, write `upgrades/plan.json` with the confirmed upgrade plan.
-Copilot writes this file directly (no script needed) — bypasses shell JSON-quoting entirely.
+Copilot writes `upgrades/pr-body.md` directly from in-memory data (Steps 1–5) — no intermediate
+`plan.json` and no `generate-pr-body` script call needed. This eliminates two file I/O operations.
 
-```json
-{
-  "title": "Upgrade Conga packages: Platform 202604.2 + Revenue 202605.1",
-  "sprint": "202604.2",
-  "changes": [
-    {"project": "Asset.API",     "namespace": "Platform", "package": "Authorization.Middleware", "from": "202602.1.8",  "to": "202604.2.11"},
-    {"project": "Asset.Manager", "namespace": "Revenue",  "package": "Callbacks",               "from": "202603.2.2",  "to": "202604.2.2"}
-  ],
-  "skipped": []
-}
+Template:
+```markdown
+## Upgrade Conga packages: Platform <sprint> + Revenue latest
+
+**Date:** <YYYY-MM-DD HH:MM>
+
+---
+### Packages Updated
+
+| Project | Namespace | Package | From | To |
+|---------|-----------|---------|------|----|
+| `<proj>` | <ns> | `<pkg>` | `<from>` | `<to>` |
+...
+
+---
+### Build & Test
+
+- **Build:** 0 errors, <N> warnings
+- **Tests:** <passed> passed, <skipped> skipped, <failed> failed
+
+---
+### Checklist
+- [x] `dotnet build` passed
+- [x] All unit tests passing
+- [x] Only `Conga.*` versions modified
+- [x] Draft PR — ready for review
 ```
 
-Save to: `<copilot-skills-root>\conga-package-upgrader\upgrades\plan.json`
+Save to: `<copilot-skills-root>\conga-package-upgrader\upgrades\pr-body.md`
+
+> Write this file **after** Step 8 (tests) so build + test results are included.
+> `generate-pr-body` script remains as a CLI fallback if Copilot is unavailable.
 
 ---
 
@@ -292,48 +348,62 @@ Save to: `<copilot-skills-root>\conga-package-upgrader\upgrades\plan.json`
 > ```
 
 ```powershell
-cd "<solution-root>" ; dotnet build
+cd "<solution-root>" ; dotnet build --no-restore
 ```
+`--no-restore` skips redundant NuGet restore — packages already in global cache. Saves 5–15s.
 Errors are blocking. Warnings are acceptable.
 
 ---
 
 ### Step 8 — Test
 ```powershell
-cd "<solution-root>" ; dotnet test --no-build --logger "trx;LogFileName=TestResults.trx" --results-directory .\TestResults
+cd "<solution-root>"
+Remove-Item ".\TestResults" -Recurse -Force -ErrorAction SilentlyContinue
+dotnet test --no-build --logger "trx;LogFileName=TestResults.trx" --results-directory .\TestResults
 ```
-`--no-build` skips redundant rebuild — saves 1–2 min on large solutions. Locate `.trx` under `TestResults\`.
+`--no-build` skips redundant rebuild — saves 1–2 min on large solutions.
+Clean `TestResults\` first to prevent stale `.trx` pickup. Locate `.trx` under `TestResults\`.
 
 ---
 
-### Step 9 — Generate PR body
-```powershell
-cd "..\copilot-skills\conga-package-upgrader"
-python upgrade_packages.py generate-pr-body `
-  --plan "upgrades\plan.json" `
-  --trx-path "<root>\TestResults\TestResults.trx"
-```
-Writes `upgrades/pr-body.md`.
+### Step 9 — (merged into Step 6)
+
+> PR body is now written directly by Copilot in Step 6 (after build + test results are known).
+> The `generate-pr-body` script is retained as a CLI fallback only.
 
 ---
 
 ### Step 10 — Push to fork
+
+> ⚠️ Push **only** to `origin` (your personal fork). Never push to `upstream` or `congaengr`.
+
 ```powershell
 cd "<solution-root>"
+git remote -v   # confirm: origin = https://github.com/<your-user>/<Repo>
 git checkout -b package-upgrade-<timestamp>
-git add .
+git add $(git diff --name-only HEAD)   # stage only files actually modified (not TestResults, not temp files)
 git commit -m "Upgrade Conga packages: Platform <sprint> + Revenue latest"
 git -c http.sslVerify=false push origin HEAD
 ```
 
+> **Why not `git add .`?** It stages everything — including `TestResults\`, temp files, and VS artifacts.
+> `git diff --name-only HEAD` returns only the `.csproj` files that were actually patched.
+
 > If push fails with SSL error: use `git -c http.sslVerify=false push origin HEAD` (corporate proxy cert).
+> If `origin` is misconfigured, run `git remote set-url origin https://github.com/<your-user>/<Repo>` then retry.
 
 ---
 
 ### Step 11 — Create draft PR
+
+> ⚠️ This PR flows **from your fork → original repo** (`congaengr/<Repo>`). No direct commits land on the original repo.
+> `--head <your-user>:branch` = your fork · `--base master` = original repo master.
+> Parse username from origin URL: `$user = (git remote get-url origin) -replace 'https://github.com/([^/]+)/.*', '$1'`
+
 ```powershell
+$user = (git remote get-url origin) -replace 'https://github.com/([^/]+)/.*', '$1'
 gh pr create --draft --base master `
-  --head <user>:package-upgrade-<timestamp> `
+  --head "${user}:package-upgrade-<timestamp>" `
   --title "Upgrade Conga packages: Platform <sprint> + Revenue latest" `
   --body-file "..\copilot-skills\conga-package-upgrader\upgrades\pr-body.md"
 ```
@@ -351,6 +421,8 @@ gh pr create --draft --base master `
 | Build failure | Review errors; may need code changes beyond package upgrade |
 | Test failure | Review failures; assess if blocking or expected |
 | `gh` auth error | Run `gh auth login` |
+| Push lands on wrong remote | `git remote -v` — ensure `origin` = your fork URL, then re-push |
+| PR targets wrong repo | Verify `--head <your-user>:branch`; never use `congaengr` as `--head` |
 
 ---
 
