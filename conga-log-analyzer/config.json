@@ -1,0 +1,35 @@
+{
+  "grafana": {
+    "dev": {
+      "url": "https://engr-telemetry.conga-panoptos.com",
+      "datasource": "loki",
+      "apiKey": ""
+    },
+    "staging": {
+      "url": "https://engr-telemetry.conga-panoptos.com",
+      "datasource": "loki",
+      "apiKey": ""
+    },
+    "production": {
+      "url": "https://engr-telemetry.conga-panoptos.com",
+      "datasource": "loki",
+      "apiKey": ""
+    }
+  },
+  "defaultTimeRangeMinutes": 60,
+  "maxLogEntries": 5000,
+  "errorKeywords": [
+    "ERROR",
+    "Exception",
+    "Failed",
+    "Timeout",
+    "NullReferenceException",
+    "deadlock"
+  ],
+  "warningKeywords": [
+    "WARN",
+    "WARNING",
+    "Retry",
+    "Degraded"
+  ]
+}

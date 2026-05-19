@@ -1,5 +1,4 @@
-﻿config.json
-downloads/
+﻿downloads/
 __pycache__/
 *.tmp
 *.log
