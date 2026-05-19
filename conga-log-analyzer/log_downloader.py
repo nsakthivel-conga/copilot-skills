@@ -55,6 +55,10 @@ RE_HTTP_STATUS = re.compile(r'([\d.]+)ms\s*-\s*(\d+)')
 # Matches exception type names like "PlatformException" or "System.NullReferenceException"
 RE_EXCEPTION_TYPE = re.compile(r'(\w+(?:\.\w+)*(?:Exception|Error))')
 
+# Matches the method name in "method start" log messages
+# Example: "[AS]:GetAssetLineItems method start" → "GetAssetLineItems"
+RE_METHOD_NAME = re.compile(r'(\w+)\s+method\s+start', re.IGNORECASE)
+
 
 # ============================================================================
 # Section 1: Configuration & Environment
@@ -213,6 +217,10 @@ def parse_structured_entry(entry):
         "class_short": class_name.rsplit(".", 1)[-1] if class_name else "",
         "method": attrs.get("MethodName", ""),
         "message": str(message),
+        "span_id": parsed.get("spanid", ""),
+        "trace_id": parsed.get("traceid", ""),
+        "exception_type": attrs.get("exception_type", ""),
+        "exception_stacktrace": attrs.get("exception_stacktrace", ""),
     }
 
 
@@ -249,7 +257,10 @@ def build_analysis(entries):
         if row["severity"] in ("Error", "Fatal", "Critical"):
             errors.append(row)
 
-    # Calculate first/last timestamp and duration for each service
+    # Calculate first/last timestamp and accumulated active duration per service.
+    # A service may be active in multiple segments (e.g. 0-10s and 50-60s in a 60s trace),
+    # so we sum only the gaps between consecutive entries of the same service rather than
+    # using the raw first-to-last span, which would include idle time between segments.
     service_timing = {}
     for row in timeline:
         svc = row["service"]
@@ -257,15 +268,19 @@ def build_analysis(entries):
             service_timing[svc] = {
                 "first": row["timestamp"], "first_ns": row["timestamp_ns"],
                 "last": row["timestamp"], "last_ns": row["timestamp_ns"],
+                "_active_ns": 0,
+                "_prev_ns": row["timestamp_ns"],
             }
         else:
+            gap_ns = row["timestamp_ns"] - service_timing[svc]["_prev_ns"]
+            service_timing[svc]["_active_ns"] += gap_ns
             service_timing[svc]["last"] = row["timestamp"]
             service_timing[svc]["last_ns"] = row["timestamp_ns"]
+            service_timing[svc]["_prev_ns"] = row["timestamp_ns"]
 
     for timing in service_timing.values():
-        timing["duration_sec"] = round(
-            (timing["last_ns"] - timing["first_ns"]) / 1_000_000_000, 3
-        )
+        timing["duration_sec"] = round(timing["_active_ns"] / 1_000_000_000, 3)
+        del timing["_active_ns"], timing["_prev_ns"]
 
     # Overall trace duration
     duration_sec = round(
@@ -303,11 +318,22 @@ def extract_error_details(timeline, repo_url):
     job_error_details = {}
     for row in timeline:
         msg = row["message"]
-        if "ErrorDetails" not in msg and "StackTrace" not in msg:
+        has_attr_trace = bool(row.get("exception_stacktrace"))
+        if not has_attr_trace and "ErrorDetails" not in msg and "StackTrace" not in msg and "Exception" not in msg and "Error while" not in msg:
             continue
 
         temp = _new_error_fields()
-        _extract_nested_error(msg, temp, repo_url)
+
+        # Use attribute-level stack trace when present
+        if has_attr_trace:
+            if row.get("exception_type"):
+                temp["exception_type"] = row["exception_type"]
+            _parse_stack_trace(row["exception_stacktrace"], temp, repo_url)
+            temp["error_stage"] = row["class_short"] or row["method"] or "unknown"
+            temp["nested_message"] = row["exception_stacktrace"].splitlines()[0][:300]
+        else:
+            _extract_nested_error(msg, temp, repo_url)
+
         if temp["stack_frames"] or temp["error_stage"]:
             stage = temp["error_stage"] or "unknown"
             job_error_details[stage] = temp
@@ -322,8 +348,16 @@ def extract_error_details(timeline, repo_url):
 
         error_info = {**row, **_new_error_fields()}
 
-        # Try extracting error details from the error message itself
-        _extract_nested_error(row["message"], error_info, repo_url)
+        # Priority 1: use exception_type / exception_stacktrace attributes directly
+        if row.get("exception_type"):
+            error_info["exception_type"] = row["exception_type"]
+        if row.get("exception_stacktrace"):
+            _parse_stack_trace(row["exception_stacktrace"], error_info, repo_url)
+            error_info["nested_message"] = row["exception_stacktrace"].splitlines()[0][:300]
+
+        # Priority 2: try extracting error details from the error message itself
+        if not error_info["stack_frames"]:
+            _extract_nested_error(row["message"], error_info, repo_url)
 
         # If this error has no stack trace, try to attach one from Pass 1
         if not error_info["stack_frames"] and job_error_details:
@@ -347,6 +381,23 @@ def extract_error_details(timeline, repo_url):
                 error_info["exception_type"] = match.group(1)
 
         enriched_errors.append(error_info)
+
+    # Pass 3: Surface any Information-level exceptions that were never attached
+    # to an Error-severity entry (i.e., the only evidence of the failure is an Info log)
+    for stage, details in job_error_details.items():
+        if stage not in used_stages:
+            error_info = {
+                "severity": "Information",
+                "service": "",
+                "class_full": "",
+                "class_short": "",
+                "method": "",
+                "message": details.get("nested_message", ""),
+                "timestamp": "",
+                "timestamp_ns": 0,
+                **details,
+            }
+            enriched_errors.append(error_info)
 
     return enriched_errors
 
@@ -498,11 +549,68 @@ def extract_performance_data(timeline):
         key=lambda x: -x["delta_ms"],
     )[:10]
 
-    # Total time attributed to each service
+    # Total time attributed to each service.
+    # Only accumulate delta_ms when the previous entry belongs to the same service,
+    # so inter-service wait time is not incorrectly credited to the next service that logs.
     service_time = {}
-    for s in segments:
+    for i, s in enumerate(segments):
         svc = s["service"]
-        service_time[svc] = service_time.get(svc, 0) + s["delta_ms"]
+        delta = s["delta_ms"] if i > 0 and segments[i - 1]["service"] == svc else 0
+        service_time[svc] = service_time.get(svc, 0) + delta
+
+    # --- Span-based method call correlation ---
+    # Match "method start" → "method end" pairs using spanid as the correlation key.
+    # Each unique spanid represents one invocation, so 10 calls to GetAssetLineItems
+    # produce 10 independent start/end pairs with separate spanids.
+    span_starts = {}   # span_id → start row
+    method_calls = []  # completed matched pairs
+
+    for row in timeline:
+        span = row.get("span_id", "")
+        if not span:
+            continue
+        msg_lower = row["message"].lower()
+        if "method start" in msg_lower:
+            span_starts[span] = row
+        elif "method end" in msg_lower and span in span_starts:
+            start_row = span_starts.pop(span)
+            duration_ms = round(
+                (row["timestamp_ns"] - start_row["timestamp_ns"]) / 1_000_000, 3
+            )
+            name_match = RE_METHOD_NAME.search(start_row["message"])
+            method_name = name_match.group(1) if name_match else start_row["message"][:50]
+            method_calls.append({
+                "span_id":     span,
+                "method_name": method_name,
+                "service":     row["service"],
+                "start":       start_row["timestamp"],
+                "end":         row["timestamp"],
+                "duration_ms": duration_ms,
+            })
+
+    # Aggregate per method name: call count, total/avg/min/max duration
+    method_stats = {}
+    for call in method_calls:
+        name = call["method_name"]
+        if name not in method_stats:
+            method_stats[name] = {
+                "method_name": name,
+                "service":     call["service"],
+                "call_count":  0,
+                "total_ms":    0.0,
+                "min_ms":      float("inf"),
+                "max_ms":      0.0,
+            }
+        s = method_stats[name]
+        s["call_count"] += 1
+        s["total_ms"]   += call["duration_ms"]
+        s["min_ms"]      = min(s["min_ms"], call["duration_ms"])
+        s["max_ms"]      = max(s["max_ms"], call["duration_ms"])
+
+    for s in method_stats.values():
+        s["avg_ms"]   = round(s["total_ms"] / s["call_count"], 3)
+        s["total_ms"] = round(s["total_ms"], 3)
+        s["min_ms"]   = round(s["min_ms"], 3)
 
     return {
         "segments": segments,
@@ -512,6 +620,8 @@ def extract_performance_data(timeline):
             k: round(v, 1)
             for k, v in sorted(service_time.items(), key=lambda x: -x[1])
         },
+        "method_calls": method_calls,
+        "method_stats": method_stats,
     }
 
 
@@ -575,6 +685,17 @@ def write_summary_md(analysis, perf_data, error_details, out_dir):
         for h in sorted(perf_data["http_calls"], key=lambda x: -x["duration_ms"])[:5]:
             lines.append(f"| {h['duration_ms']}ms | {h['service']} | {h['status']} | {h['url'][:60]} |")
 
+    # --- Method call summary (top 5 by total time) ---
+    if perf_data["method_stats"]:
+        lines.append("\n## Method Calls\n")
+        lines.append("| Method | Calls | Total | Avg | Max |")
+        lines.append("|--------|-------|-------|-----|-----|")
+        for s in sorted(perf_data["method_stats"].values(), key=lambda x: -x["total_ms"])[:5]:
+            lines.append(
+                f"| {s['method_name']} | {s['call_count']} |"
+                f" {s['total_ms']}ms | {s['avg_ms']}ms | {s['max_ms']}ms |"
+            )
+
     # --- Pointers to detail files ---
     lines.append("\n## Detail Files\n")
     if error_details:
@@ -588,14 +709,21 @@ def write_summary_md(analysis, perf_data, error_details, out_dir):
     return md
 
 
-def write_error_analysis_md(error_details, out_dir, repo_url):
-    """Write error-analysis.md — stack traces, GitHub links, exception details."""
+def write_error_analysis_md(error_details, out_dir, repo_url, compact=False):
+    """Write error-analysis.md — stack traces, GitHub links, exception details.
+
+    compact=True: limits stack frames to top 3 and skips raw message body,
+    keeping the file small (~400 tokens) for LLM consumption.
+    compact=False (default): full output for human browsing.
+    """
     if not error_details:
         return
 
     lines = [f"# Error Analysis ({len(error_details)} errors)\n"]
     if repo_url:
         lines.append(f"Repository: {repo_url}\n")
+    if compact:
+        lines.append("_Compact mode: top 3 stack frames only. Re-run without --compact for full output._\n")
 
     for i, e in enumerate(error_details, 1):
         lines.append(f"## Error {i} - [{e['timestamp']}]\n")
@@ -612,22 +740,94 @@ def write_error_analysis_md(error_details, out_dir, repo_url):
         # Nested error message (from ErrorDetails)
         if e["nested_message"]:
             lines.append("\n### Error Message\n")
-            lines.append(f"```\n{e['nested_message'][:1000]}\n```")
+            msg_limit = 200 if compact else 1000
+            lines.append(f"```\n{e['nested_message'][:msg_limit]}\n```")
 
         # Stack trace with GitHub links (">>>" marks the top frame)
         if e["stack_frames"]:
             lines.append("\n### Stack Trace\n")
-            for j, frame in enumerate(e["stack_frames"]):
-                prefix = ">>>" if j == len(e["stack_frames"]) - 1 else "   "
+            frames = e["stack_frames"][-3:] if compact else e["stack_frames"]
+            for j, frame in enumerate(frames):
+                prefix = ">>>" if j == len(frames) - 1 else "   "
                 lines.append(f"{prefix} `{frame['file']}:{frame['line']}` - {frame['method']}")
                 if frame["github_url"]:
                     lines.append(f"    {frame['github_url']}")
+            if compact and len(e["stack_frames"]) > 3:
+                lines.append(f"   _...{len(e['stack_frames']) - 3} more frames omitted (compact mode)_")
 
-        # Full raw message for reference
-        lines.append("\n### Full Message\n")
-        lines.append(f"```\n{e['message'][:2000]}\n```\n")
+        # Full raw message — skipped in compact mode
+        if not compact:
+            lines.append("\n### Full Message\n")
+            lines.append(f"```\n{e['message'][:2000]}\n```\n")
+
+        lines.append("")
 
     (out_dir / "error-analysis.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_perf_summary_md(perf_data, analysis, out_dir):
+    """Write perf-summary.md — compact ~1.5KB performance distillation for LLM consumption.
+
+    Deliberately excludes the full waterfall (178KB) and per-call detail.
+    Contains only: service time, top 5 slow segments, top 5 method calls, HTTP calls.
+    Target: ~1,500 tokens — safe to include alongside summary.md + error-analysis.md.
+    """
+    lines = [
+        "# Performance Summary (LLM-optimised)\n",
+        f"Trace duration: **{analysis['duration_sec']}s** | Entries: {analysis['total']}\n",
+    ]
+
+    # --- Service time breakdown ---
+    lines.append("## Time by Service\n")
+    lines.append("| Service | Time Spent | % of Total |")
+    lines.append("|---------|-----------|------------|")
+    total_ms = sum(perf_data["service_time_ms"].values()) or 1
+    for svc, ms in perf_data["service_time_ms"].items():
+        pct = round(ms / total_ms * 100, 1)
+        display = f"{ms}ms" if ms < 1000 else f"{round(ms / 1000, 1)}s"
+        lines.append(f"| {svc} | {display} | {pct}% |")
+
+    # --- Top 5 slow segments (the biggest time gaps — where work actually happened) ---
+    if perf_data["slow_segments"]:
+        lines.append("\n## Slow Segments (top 5 gaps between log entries)\n")
+        lines.append("> A large gap = the service was doing silent work (DB call, HTTP, CPU)\n")
+        lines.append("| Gap | Service | Class | What logged after the gap |")
+        lines.append("|-----|---------|-------|--------------------------|")
+        for s in perf_data["slow_segments"][:5]:
+            gap = f"{s['delta_ms']}ms" if s["delta_ms"] < 1000 else f"{round(s['delta_ms'] / 1000, 1)}s"
+            lines.append(
+                f"| **{gap}** | {s['service']} | {s['class_short']} "
+                f"| {s['message_preview'][:80]} |"
+            )
+
+    # --- Method call summary (span-correlated start/end pairs) ---
+    if perf_data["method_stats"]:
+        lines.append(f"\n## Method Durations ({len(perf_data['method_calls'])} matched calls)\n")
+        lines.append("| Method | Service | Calls | Total | Avg | Max |")
+        lines.append("|--------|---------|-------|-------|-----|-----|")
+        for s in sorted(perf_data["method_stats"].values(), key=lambda x: -x["total_ms"])[:5]:
+            lines.append(
+                f"| {s['method_name']} | {s['service']} | {s['call_count']} |"
+                f" {s['total_ms']}ms | {s['avg_ms']}ms | {s['max_ms']}ms |"
+            )
+
+    # --- HTTP calls (if any) ---
+    if perf_data["http_calls"]:
+        lines.append(f"\n## HTTP Calls ({len(perf_data['http_calls'])} total)\n")
+        lines.append("| Duration | Service | Status | URL |")
+        lines.append("|----------|---------|--------|-----|")
+        for h in sorted(perf_data["http_calls"], key=lambda x: -x["duration_ms"])[:5]:
+            lines.append(
+                f"| {h['duration_ms']}ms | {h['service']} | {h['status']} | {h['url'][:70]} |"
+            )
+    else:
+        lines.append("\n_No HTTP calls detected in this trace._\n")
+
+    lines.append(
+        "\n> Full waterfall with all entries: see `performance.md` (not for LLM — 178KB)"
+    )
+
+    (out_dir / "perf-summary.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def write_performance_md(perf_data, analysis, out_dir):
@@ -663,6 +863,25 @@ def write_performance_md(perf_data, analysis, out_dir):
         for s in perf_data["slow_segments"]:
             gap = f"{s['delta_ms']}ms" if s["delta_ms"] < 1000 else f"{round(s['delta_ms'] / 1000, 1)}s"
             lines.append(f"| **{gap}** | {s['timestamp']} | {s['service']} | {s['class_short']} | {s['message_preview'][:70]} |")
+
+    # --- Method call analysis (spanid-correlated start/end pairs) ---
+    if perf_data["method_stats"]:
+        lines.append(f"\n## Method Call Analysis ({len(perf_data['method_calls'])} matched calls)\n")
+        lines.append("| Method | Service | Calls | Total | Avg | Min | Max |")
+        lines.append("|--------|---------|-------|-------|-----|-----|-----|")
+        for s in sorted(perf_data["method_stats"].values(), key=lambda x: -x["total_ms"]):
+            lines.append(
+                f"| {s['method_name']} | {s['service']} | {s['call_count']} |"
+                f" {s['total_ms']}ms | {s['avg_ms']}ms | {s['min_ms']}ms | {s['max_ms']}ms |"
+            )
+
+        # Per-call detail for each method
+        lines.append(f"\n### Per-Call Detail\n")
+        for call in sorted(perf_data["method_calls"], key=lambda x: -x["duration_ms"]):
+            lines.append(
+                f"- **{call['method_name']}** | span `{call['span_id']}` | "
+                f"{call['start']} → {call['end']} | **{call['duration_ms']}ms**"
+            )
 
     # --- Full waterfall (every entry with delta from previous) ---
     lines.append(f"\n## Waterfall ({analysis['total']} entries)\n")
@@ -719,8 +938,192 @@ def analyze_local(raw_logs_path):
     return entries, out_dir
 
 
-def run_analysis(entries, out_dir, repo_url=""):
+# ============================================================================
+# Section 9: Plain .log file parser (Lightsaber / Akka format)
+# ============================================================================
+
+# Matches: [INFO][05/08/2026 20:22:17.549Z][Thread 0047][actor-path] message
+RE_PLAIN_LOG = re.compile(
+    r'^\[(?P<level>\w+)\]\[(?P<ts>\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+Z)\]'
+    r'\[Thread\s+(?P<thread>\w+)\]\[(?P<actor>[^\]]*)\]\s*(?P<msg>.*)',
+    re.DOTALL,
+)
+
+# Exception/stack-frame continuation lines (no leading bracket)
+RE_STACK_CONTINUATION = re.compile(r'^\s+(at\s+\S+|Cause:|System\.|Apttus\.|Conga\.)')
+
+_LEVEL_MAP = {
+    "INFO":    "Information",
+    "DEBUG":   "Debug",
+    "WARN":    "Warning",
+    "WARNING": "Warning",
+    "ERROR":   "Error",
+    "FATAL":   "Fatal",
+}
+
+
+def parse_plain_log_entries(file_path: Path) -> list[dict]:
+    """Parse a Lightsaber/Akka plain-text .log file into the same entry schema
+    used by parse_loki_response() so it can flow through the existing pipeline.
+
+    Entry format:
+        [LEVEL][MM/DD/YYYY HH:MM:SS.mmmZ][Thread NNNN][actor-path] message
+        (continuation lines with stack frames or 'Cause:' are appended to the message)
+
+    Returns a list of dicts with keys: TimestampNs, Timestamp, Message (JSON).
+    The Message is a synthetic JSON body that parse_structured_entry() can decode.
+    """
+    entries = []
+    text = file_path.read_text(encoding="utf-8", errors="replace")
+
+    # Split into logical log records: each record starts with a '[LEVEL][' header.
+    # Continuation lines (stack frames, Cause:) are folded into the previous record.
+    records: list[tuple[str, str, str, str, list[str]]] = []  # (level, ts, thread, actor, lines)
+    for raw_line in text.splitlines():
+        m = RE_PLAIN_LOG.match(raw_line)
+        if m:
+            records.append((
+                m.group("level"),
+                m.group("ts"),
+                m.group("thread"),
+                m.group("actor"),
+                [m.group("msg")],
+            ))
+        elif records and RE_STACK_CONTINUATION.match(raw_line):
+            records[-1][4].append(raw_line.rstrip())
+
+    # Derive service name from the file stem: "cart-0_cart (4)" → "cart-0"
+    # and "cart-web-2_cart-web (1)" → "cart-web-2"
+    stem = file_path.stem  # e.g. "cart-0_cart (4)"
+    service_name = stem.split("_")[0] if "_" in stem else stem
+
+    for level, ts_str, thread, actor, msg_lines in records:
+        # Parse timestamp → nanoseconds (used for sorting)
+        try:
+            dt = datetime.strptime(ts_str, "%m/%d/%Y %H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        ts_ns = int(dt.timestamp() * 1_000_000_000)
+        ts_fmt = dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        full_msg = "\n".join(msg_lines).strip()
+
+        # Detect exception stack in continuation lines
+        exception_type = ""
+        exception_stacktrace = ""
+        stack_lines = [l for l in msg_lines[1:] if l.strip()]
+        if stack_lines:
+            exception_stacktrace = "\n".join(stack_lines)
+            # Try to extract exception type from "Cause: Some.Exception: ..."
+            cause_match = re.search(r'Cause:\s*([\w.]+(?:Exception|Error))', exception_stacktrace)
+            if cause_match:
+                exception_type = cause_match.group(1)
+            else:
+                exc_match = RE_EXCEPTION_TYPE.search(exception_stacktrace)
+                if exc_match:
+                    exception_type = exc_match.group(1)
+
+        # Derive a short class name from the actor path
+        # e.g. "akka.tcp://lightsaber@.../CartActor/4/..." → "CartActor"
+        class_name = ""
+        actor_parts = actor.split("/")
+        for part in reversed(actor_parts):
+            if part and not part.isdigit() and part not in ("user", "system", "sharding"):
+                class_name = part.split("@")[0] if "@" in part else part
+                break
+
+        # Build a synthetic JSON body that parse_structured_entry() can read
+        body = {
+            "body": {"message": full_msg},
+            "attributes": {
+                "SeverityText": _LEVEL_MAP.get(level.upper(), level),
+                "ClassName": class_name,
+                "MethodName": "",
+                "exception_type": exception_type,
+                "exception_stacktrace": exception_stacktrace,
+            },
+            "resources": {
+                "service.name": service_name,
+            },
+            "spanid": "",
+            "traceid": "",
+        }
+
+        entries.append({
+            "TimestampNs": ts_ns,
+            "Timestamp": ts_fmt,
+            "Message": json.dumps(body, ensure_ascii=False),
+        })
+
+    return entries
+
+
+# ============================================================================
+# Section 10: Folder-based multi-file analysis (*.json + *.log)
+# ============================================================================
+
+def analyze_folder(folder_path: str) -> tuple[list[dict], Path]:
+    """Merge all *.json and *.log files in a folder into one entry list.
+
+    *.json files are assumed to be Grafana raw-logs.json format.
+    *.log files are parsed with parse_plain_log_entries().
+    Entries from all files are merged and sorted by timestamp before analysis.
+    """
+    folder = Path(folder_path)
+    if not folder.exists() or not folder.is_dir():
+        print(f"ERROR: Folder not found: {folder}")
+        sys.exit(1)
+
+    json_files = sorted(folder.glob("*.json"))
+    log_files  = sorted(folder.glob("*.log"))
+
+    if not json_files and not log_files:
+        print(f"ERROR: No *.json or *.log files found in {folder}")
+        sys.exit(1)
+
+    all_entries: list[dict] = []
+
+    for jf in json_files:
+        print(f"  [json] Loading {jf.name} ...")
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+            # Grafana raw-logs.json is a list of {TimestampNs, Timestamp, Message}
+            if isinstance(data, list):
+                all_entries.extend(data)
+            # Loki raw API response ({"data": {"result": [...]}})
+            elif isinstance(data, dict) and "data" in data:
+                all_entries.extend(parse_loki_response(data))
+            else:
+                print(f"    WARNING: Unrecognised JSON structure in {jf.name} — skipping")
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"    WARNING: Could not read {jf.name}: {exc}")
+
+    for lf in log_files:
+        print(f"  [log]  Parsing {lf.name} ...")
+        try:
+            parsed = parse_plain_log_entries(lf)
+            print(f"         -> {len(parsed)} entries")
+            all_entries.extend(parsed)
+        except OSError as exc:
+            print(f"    WARNING: Could not read {lf.name}: {exc}")
+
+    if not all_entries:
+        print("ERROR: No log entries found in any file.")
+        sys.exit(1)
+
+    # Sort merged entries by timestamp (nanoseconds) for a coherent timeline
+    all_entries.sort(key=lambda e: e["TimestampNs"])
+
+    print(f"\nMerged {len(all_entries)} entries from "
+          f"{len(json_files)} JSON + {len(log_files)} .log files")
+
+    return all_entries, folder
+
+
+def run_analysis(entries, out_dir, repo_url="", compact=False):
     """Full pipeline: parse → errors → perf → write all output files."""
+    if compact:
+        print("[compact mode] error-analysis.md capped to 3 frames — ~400 tokens for LLM use")
     analysis = build_analysis(entries)
     if not analysis:
         print("Could not parse any structured log entries.")
@@ -740,7 +1143,8 @@ def run_analysis(entries, out_dir, repo_url=""):
     summary_md = write_summary_md(analysis, perf_data, error_details, out_dir)
     print(f"\n{summary_md}")
 
-    write_error_analysis_md(error_details, out_dir, repo_url)
+    write_error_analysis_md(error_details, out_dir, repo_url, compact=compact)
+    write_perf_summary_md(perf_data, analysis, out_dir)
     write_performance_md(perf_data, analysis, out_dir)
     write_timeline_md(analysis, out_dir)
 
@@ -749,6 +1153,15 @@ def run_analysis(entries, out_dir, repo_url=""):
     for f in sorted(out_dir.iterdir()):
         size_kb = round(f.stat().st_size / 1024, 1)
         print(f"  {f.name:<24} {size_kb:>8} KB")
+
+    # Explicit LLM read instructions — Copilot reads terminal output and must follow these
+    print(f"\n{'-' * 60}")
+    print("COPILOT: Read ONLY these three files for analysis:")
+    print(f"  {out_dir / 'summary.md'}          (~700 tokens)")
+    print(f"  {out_dir / 'error-analysis.md'}   (~2,250 tokens)")
+    print(f"  {out_dir / 'perf-summary.md'}      (~1,500 tokens)")
+    print("DO NOT read: raw-logs.json, summary.json, timeline.md, performance.md")
+    print(f"{'-' * 60}")
 
 
 # ============================================================================
@@ -769,17 +1182,27 @@ def main():
                         help="Minutes of history to search (default: from config.json)")
     parser.add_argument("--analyze-local", metavar="PATH",
                         help="Skip download. Analyze a local raw-logs.json file")
+    parser.add_argument("--analyze-folder", metavar="PATH",
+                        help="Merge and analyze all *.json and *.log files in a folder")
     parser.add_argument("--repo-url", default="https://github.com/congaengr/Conga.Revenue.Renewal",
                         help="GitHub repo URL for source code links")
+    parser.add_argument("--compact", action="store_true",
+                        help="Compact error-analysis.md (top 3 frames only, ~400 tokens) for LLM consumption")
     args = parser.parse_args()
 
     # --- Mode 1: Analyze local file ---
     if args.analyze_local:
         entries, out_dir = analyze_local(args.analyze_local)
-        run_analysis(entries, out_dir, args.repo_url)
+        run_analysis(entries, out_dir, args.repo_url, compact=args.compact)
         return
 
-    # --- Mode 2: Download from Grafana ---
+    # --- Mode 2: Analyze a folder (*.json + *.log merged) ---
+    if args.analyze_folder:
+        entries, out_dir = analyze_folder(args.analyze_folder)
+        run_analysis(entries, out_dir, args.repo_url, compact=args.compact)
+        return
+
+    # --- Mode 3: Download from Grafana ---
     config = load_config()
 
     time_range = args.time_range if args.time_range > 0 else config.get("defaultTimeRangeMinutes", 60)
@@ -840,7 +1263,7 @@ def main():
         json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    run_analysis(entries, out_dir, args.repo_url)
+    run_analysis(entries, out_dir, args.repo_url, compact=args.compact)
 
 
 if __name__ == "__main__":

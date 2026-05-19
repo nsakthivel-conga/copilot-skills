@@ -1,0 +1,10 @@
+﻿config.json
+downloads/
+__pycache__/
+*.tmp
+*.log
+*.zip
+
+# Downloaded log files - large, trace-specific, not source code
+# raw-logs.json = ~1.4MB per trace (~340K tokens)
+downloads/

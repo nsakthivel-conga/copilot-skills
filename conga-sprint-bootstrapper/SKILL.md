@@ -1,16 +1,35 @@
-# Conga Sprint Bootstrapper Skill üåø
+---
+name: conga-sprint-bootstrapper
+description: |
+  Two-step sprint handover for one or multiple GitHub repos: cut a release branch
+  from master, then bump IMAGE_TAG in all build.properties files under CICDAutomation/
+  via a draft PR. Uses GitHub CLI throughout ó no local clone required.
+---
 
-## Purpose
+# Conga Sprint Bootstrapper Skill ??
 
-Two-step sprint handover for **one or multiple GitHub repos**:
-1. Cut a release branch from master (e.g., `release-202604-2`)
-2. Bump `IMAGE_TAG` in all `build.properties` files under `CICDAutomation/` via draft PR
+## The Core Idea
 
-Uses **GitHub CLI** throughout ‚Äî no local clone required.
+Standard sprint handover is error-prone manual work. This skill is different:
+
+1. **Branch layer** ó Release branches are cut directly from the upstream master SHA via the GitHub API. No local clone, no accidental divergence.
+2. **Tag bump layer** ó `IMAGE_TAG` and `NUGET_TAG` are updated on your fork working branch and proposed via a cross-fork draft PR. The upstream branches page stays clean.
+3. **Gate layer** ó Two explicit confirmation gates separate branch creation from tag bumping. You can do Step 1 today and Step 2 tomorrow.
+
+> GitHub API handles all file I/O; Copilot handles all orchestration.
 
 ---
 
-## Quickstart
+## Two Steps
+
+| Step | What happens | Where |
+|------|-------------|-------|
+| **Step 1** | Cut release branch from master SHA | Upstream repo (permanent) |
+| **Step 2** | Bump `IMAGE_TAG` + `NUGET_TAG`, open draft PR | Your fork ? upstream PR |
+
+---
+
+## ? Quick Start
 
 ```
 Bootstrap sprint for Asset.API, branch release-202604-2, IMAGE_TAG 202605.1
@@ -19,24 +38,24 @@ Bootstrap sprint for Renewal and Billing, branch release-202604-2, IMAGE_TAG 202
 
 Copilot will:
 1. Pre-flight repos (check access, find files, show current tags)
-2. Ask **"Proceed with Step 1?"** ‚Üí creates release branches
-3. Ask **"Proceed with Step 2?"** ‚Üí bumps IMAGE_TAG, creates draft PRs
+2. Ask **"Proceed with Step 1?"** ? creates release branches
+3. Ask **"Proceed with Step 2?"** ? bumps IMAGE_TAG, creates draft PRs
 
 ---
 
 ## Invocation Formats
 
 ```bash
-# Single repo ‚Äî inferred from workspace
+# Single repo ó inferred from workspace
 Bootstrap sprint for <Project>, branch <branch-name>, IMAGE_TAG <new-tag>
 
-# Single repo ‚Äî explicit
+# Single repo ó explicit
 Bootstrap sprint for repo <owner/repo>, project <Project>, branch <branch-name>, IMAGE_TAG <new-tag>
 
-# Multiple repos ‚Äî shared settings
+# Multiple repos ó shared settings
 Bootstrap sprint for repos <repo1> and <repo2>, branch <branch-name>, IMAGE_TAG <new-tag>
 
-# Multiple repos ‚Äî per-repo settings
+# Multiple repos ó per-repo settings
 Bootstrap sprint:
   repo <owner/repo1>, branch <branch1>, IMAGE_TAG <tag1>
   repo <owner/repo2>, branch <branch2>, IMAGE_TAG <tag2>
@@ -44,108 +63,81 @@ Bootstrap sprint:
 
 ---
 
-## Parameters
+## Operations
 
-| Parameter | Required | Example | Description |
-|-----------|----------|---------|-------------|
-| `repo` | Optional | `congaengr/Renewal` | Inferred from workspace if omitted |
-| `project` | Optional | `Renewal` | Filters `CICDAutomation/` subdirs by prefix. Omit ‚Üí update all. |
-| `branch-name` | ‚úÖ Yes | `release-202603-2` | Release branch name |
-| `IMAGE_TAG` | ‚úÖ Yes | `202604.1` | New tag value for next sprint |
+### Pre-flight
 
----
+Before executing anything:
 
-## Prerequisites
-
-| Tool | Purpose | Setup |
-|------|---------|-------|
-| **GitHub CLI** | All operations | `winget install GitHub.cli` ‚Üí `gh auth login` |
-
----
-
-## Workflow
-
-### Phase 0 ‚Äî Pre-flight
-
-1. Check `gh auth status` ‚Üí get fork owner (`nsakthivel-conga`)
+1. Run `gh auth status` ? get fork owner (e.g. `<your-github-user>`)
 2. Parse repos from input (or infer from workspace)
-3. Verify each repo exists and you have a fork
-4. Discover all `build.properties` under `CICDAutomation/` with `IMAGE_TAG` or `NUGET_TAG`
-5. Show summary table
+3. Verify each repo exists and is accessible
+4. Discover all `build.properties` under `CICDAutomation/` containing `IMAGE_TAG` or `NUGET_TAG`
+5. Show summary table of what will change
 
-Hard failures ‚Üí stop before executing anything.
+> Hard failures at any pre-flight check ? stop before executing anything.
 
 ---
 
-### Confirmation Gates
+### Step 1 ó Create Release Branches
 
-**Gate 1** ‚Äî Approve Step 1 (create release branches):
+**Gate 1** ó show plan and wait for approval:
 ```
 Step 1: Create release branches
-  ‚úÖ congaengr/Renewal     ‚Üí release-202604-2
-  ‚úÖ congaengr/Asset.API   ‚Üí release-202604-2
+  ? congaengr/Renewal     ? release-202604-2
+  ? congaengr/Asset.API   ? release-202604-2
 Proceed? (yes/no)
 ```
 
-**Gate 2** ‚Äî Approve Step 2 (bump IMAGE_TAG):
-```
-Step 2: Bump IMAGE_TAG via draft PR
-  ‚úÖ congaengr/Renewal     202604.1 ‚Üí 202604.2  (2 files)
-  ‚úÖ congaengr/Asset.API   202604.1 ‚Üí 202604.2  (2 files)
-Proceed? (yes/no)
-```
-
----
-
-### Step 1 ‚Äî Create Release Branches
-
-For each repo:
+For each repo after approval:
 ```powershell
 $masterSha = gh api repos/<owner>/<repo>/git/ref/heads/master --jq '.object.sha'
 gh api repos/<owner>/<repo>/git/refs -X POST -f ref="refs/heads/<branch>" -f sha="$masterSha"
 ```
 
-Branch exists ‚Üí `‚ùå already exists` ‚Üí skip repo  
-Success ‚Üí `‚úÖ created`
+| Result | Action |
+|--------|--------|
+| Branch created | `? created` |
+| Branch already exists | `? already exists` ó skip repo |
 
 ---
 
-### Step 2 ‚Äî Bump IMAGE_TAG via GitHub API
+### Step 2 ó Bump IMAGE_TAG via Draft PR
 
-For each repo (Step 1 ‚úÖ only):
+**Gate 2** ó show plan and wait for approval:
+```
+Step 2: Bump IMAGE_TAG via draft PR
+  ? congaengr/Renewal     202604.1 ? 202604.2  (2 files)
+  ? congaengr/Asset.API   202604.1 ? 202604.2  (2 files)
+Proceed? (yes/no)
+```
 
-**2a ‚Äî Create working branch on your fork:**
+For each repo after approval (Step 1 ? only):
+
+**2a ó Create working branch on your fork:**
 ```powershell
 $masterSha = gh api repos/<owner>/<repo>/git/ref/heads/master --jq '.object.sha'
 gh api repos/<fork-owner>/<repo>/git/refs -X POST `
   -f ref="refs/heads/chore/bump-image-tag-<tag>" -f sha="$masterSha"
 ```
 
-**2b ‚Äî Update each `build.properties` file on the fork:**
+**2b ó Update each `build.properties` file on the fork:**
 ```powershell
-# Read file from fork branch
 $fileInfo = gh api "repos/<fork>/contents/<path>?ref=chore/bump-image-tag-<tag>" | ConvertFrom-Json
-
-# Decode Base64 content
-$clean = $fileInfo.content -replace [char]10,"" -replace [char]13,""
-$decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($clean))
-
-# Replace IMAGE_TAG and NUGET_TAG lines
-$updated = $decoded -replace "(?m)^IMAGE_TAG=.*", "IMAGE_TAG=<new-tag>"
-$updated = $updated -replace "(?m)^NUGET_TAG=.*", "NUGET_TAG=<new-tag>"
-
-# Encode and write back to fork branch
-$encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($updated))
+$clean    = $fileInfo.content -replace [char]10,"" -replace [char]13,""
+$decoded  = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($clean))
+$updated  = $decoded -replace "(?m)^IMAGE_TAG=.*", "IMAGE_TAG=<new-tag>"
+$updated  = $updated -replace "(?m)^NUGET_TAG=.*",  "NUGET_TAG=<new-tag>"
+$encoded  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($updated))
 $encoded | Out-File "$env:TEMP\encoded.txt" -Encoding ascii -NoNewline
 $enc = Get-Content "$env:TEMP\encoded.txt" -Raw
-
 gh api "repos/<fork>/contents/<path>" -X PUT `
   -f message="chore: bump IMAGE_TAG to <tag>" `
   -f content="$enc" -f sha="$fileInfo.sha" `
   -f branch="chore/bump-image-tag-<tag>"
 ```
 
-**2c ‚Äî Create cross-fork draft PR:**
+**2c ó Create cross-fork draft PR:**
 ```powershell
 gh pr create --repo <upstream> --draft `
   --title "chore: bump IMAGE_TAG to <tag> [sprint bootstrap]" `
@@ -155,57 +147,57 @@ gh pr create --repo <upstream> --draft `
 
 ---
 
-## Error Handling
+## Constraints
+
+- ? Always run pre-flight before any write operation
+- ? Two confirmation gates ó Gate 1 before branch creation, Gate 2 before tag bump
+- ? Working branch lives on your fork ó upstream branches page stays clean
+- ? Release branch (Step 1) lives on upstream ó it is permanent
+- ? Use `;` not `&&` to chain commands (PowerShell 5.1 parse error)
+- ? Use `--body-file` for PRs ó never inline `--body`
+- ? First `gh` call is slow (2ñ5s) ó auth cache cold read; do not retry
+- ? Do NOT skip pre-flight ó missing `build.properties` is a hard stop
+- ? Do NOT execute Step 2 for a repo where Step 1 was skipped
+- ? Do NOT proceed past `no` at Gate 1 ó cancel everything
+- ? `no` at Gate 2 ó report Step 1 results only, do not bump tags
+
+---
+
+## Error Handling Reference
 
 | Situation | Action |
 |-----------|--------|
-| `gh auth status` fails | Stop: `‚õî Run: gh auth login` |
-| Repo not accessible | Hard failure ‚Äî stop before executing |
+| `gh auth status` fails | ? Stop: `Run: gh auth login` |
+| Repo not accessible | Hard failure ó stop all before executing |
 | Fork not found | Hard failure: "Create fork at `https://github.com/<repo>/fork`" |
-| No `build.properties` with `IMAGE_TAG` | Hard failure ‚Äî stop |
-| Release branch already exists (Step 1) | `‚ùå already exists` ‚Äî skip repo |
+| No `build.properties` with `IMAGE_TAG` | Hard failure ó stop |
+| Release branch already exists (Step 1) | `? already exists` ó skip repo, continue others |
 | Working branch exists on fork (Step 2) | Delete & retry once |
-| File update fails (Step 2) | Record `‚ö†` ‚Äî continue other files |
-| PR creation fails | `‚ùå` ‚Äî continue to next repo |
-| `no` at Gate 1 | Cancel all |
-| `no` at Gate 2 | Report Step 1 only |
+| File update fails (Step 2) | Record `?` ó continue other files |
+| PR creation fails | `?` ó continue to next repo |
 
 ---
 
-## PowerShell Rules
+## Parameters Reference
 
-- Use `;` not `&&` (PS 5.1 parse error)
-- First `gh` call is slow (2‚Äì5s) ‚Äî auth cache cold read
-- Use `--body-file` for PRs (not inline `--body`)
+| Parameter | Required | Example | Description |
+|-----------|----------|---------|-------------|
+| `repo` | Optional | `congaengr/Renewal` | Inferred from workspace if omitted |
+| `project` | Optional | `Renewal` | Filters `CICDAutomation/` subdirs by prefix. Omit ? update all |
+| `branch-name` | ? Yes | `release-202603-2` | Release branch name |
+| `IMAGE_TAG` | ? Yes | `202604.1` | New tag value for next sprint |
 
----
-
-## Key Design Decisions
-
-### Why no local clone?
-GitHub API can read/write files directly. Faster and cleaner than `git clone` ‚Üí edit ‚Üí commit ‚Üí push.
-
-### Why fork for Step 2?
-The working branch (`chore/bump-image-tag-<tag>`) lives on **your fork** ‚Üí upstream branches page stays clean. The release branch (Step 1) is on upstream because it's permanent.
-
-### Why two confirmation gates?
-You might want to create release branches but delay the IMAGE_TAG bump (e.g., waiting for final testing). Separate gates = more control.
+**Prerequisites:** GitHub CLI ó `winget install GitHub.cli` ? `gh auth login`
 
 ---
 
-## Examples
+## Design Philosophy
 
-```bash
-# Current repo only
-Bootstrap sprint for Asset, branch release-202604-2, IMAGE_TAG 202605.1
+> "No local clone. GitHub API writes directly. The upstream stays clean. Your fork carries the transient work."
 
-# Explicit repo
-Bootstrap sprint for repo congaengr/Conga.Revenue.Renewal, branch release-202604-2, IMAGE_TAG 202605.1
-
-# Multiple repos, shared settings
-Bootstrap sprint for Renewal and Billing, branch release-202604-2, IMAGE_TAG 202605.1
-
-# Multiple repos, different settings
-Bootstrap sprint:
-  repo Renewal, branch release-202604-2, IMAGE_TAG 202605.1
-  repo Billing, branch release-202603-1, IMAGE_TAG 202604.1
+| Decision | Reason |
+|----------|--------|
+| **No local clone** | GitHub API reads/writes files directly ó faster and cleaner than `git clone` ? edit ? commit ? push |
+| **Fork for Step 2** | Working branch on your fork keeps the upstream branches page clean; release branch is permanent so it belongs on upstream |
+| **Two gates** | You may want to cut branches today and delay the tag bump (e.g., waiting for final QA sign-off) |
+| **Pre-flight first** | Discovering a missing fork or file after partial execution is harder to recover from than stopping upfront |
